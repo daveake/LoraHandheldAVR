@@ -4,11 +4,13 @@
 #include <ctype.h>
 #include <SPI.h>
 #include <LiquidCrystal.h>
+#include <EEPROM.h>
 
 /*---------------------------------------------------*\
 |                                                     |
-|               Arduino  2 - RFM DIO0                 |
-|               Arduino  3 - RFM DIO5                 |
+|               Arduino A0 - Switch (other side GND)  |
+|               Arduino  2 - RFM DIO5                 |
+|               Arduino  3 - RFM DIO0                 |
 |               Arduino  4 - LCD D4                   |
 |               Arduino  5 - LCD D5                   |
 |               Arduino  6 - LCD D6                   |
@@ -21,6 +23,8 @@
 |               Arduino 13 - RFM CLK                  |
 |                                                     |
 \*---------------------------------------------------*/
+
+const double Pi = 3.1415926;
 
 // RFM98
 int _slaveSelectPin = 10; 
@@ -119,14 +123,22 @@ unsigned int GPS_Latitude_Minutes, GPS_Longitude_Minutes;
 double GPS_Latitude_Seconds, GPS_Longitude_Seconds;
 char *GPS_LatitudeSign="";
 char *GPS_LongitudeSign="";
-float Longitude, Latitude;
+double GPS_Longitude, GPS_Latitude;
 unsigned int GPS_Altitude=0, MaximumAltitude=0, MaxAltitudeThisSentence=0;
 byte GotGPSThisSentence=0;
 unsigned int PreviousAltitude=0;
 unsigned int GPS_Satellites=0;
 unsigned int GPS_Speed=0;
 unsigned int GPS_Direction=0;
-
+long HAB_Altitude;
+double HAB_Latitude, HAB_Longitude;
+char LatitudeString[16], LongitudeString[16], RSSIString[6];
+unsigned long ButtonChangedAt=0;
+int ButtonState=1;
+int Editing=0;
+int ScreenNumber=0;
+uint8_t Channel=18;
+uint8_t LoraMode=0;
 
 char Hex[] = "0123456789ABCDEF";
 
@@ -140,33 +152,89 @@ void setup()
   Serial.println("");
   Serial.println("LoRa Handheld Tracker");
   Serial.println("");
+    
+  pinMode(A0, INPUT);
+  digitalWrite(A0, HIGH);
+
+  pinMode( _slaveSelectPin, OUTPUT);
+  pinMode(dio0, INPUT);
+  pinMode(dio5, INPUT);
   
   // set up the LCD's number of columns and rows: 
   lcd.begin(16, 2);
 
-  lcd.setCursor(0, 0);
-  lcd.print("Waiting for data");
-
+  DisplayScreen();
+ 
+  if ((EEPROM.read(0) == 'D') && (EEPROM.read(1) == 'A'))
+  {
+    Channel = EEPROM.read(2);
+    LoraMode = EEPROM.read(3);
+  }
+  
   setupRFM98();
 }
 
 void loop()
-{  
-  // CheckGPS();
+{ 
+  int NewButtonState;
+  
+  CheckGPS();
   
   CheckRx();
   
   UpdateDisplay();
+  
+  NewButtonState = digitalRead(A0);
+  
+  if (NewButtonState == ButtonState)
+  {
+    if (!NewButtonState && ButtonChangedAt)
+    {
+      // Button released.  How long was it pressed for?
+
+      if ((millis() - ButtonChangedAt) >= 300)
+      {
+        // Long press.  Change value / mode within this screen
+        ButtonChangedAt = 0;    // Disable any further processing of this press
+        LongPress();
+      }
+    }
+  }
+  else
+  {
+    // Button position changed
+    if (NewButtonState && ButtonChangedAt)
+    {
+      // Button released.  How long was it pressed for?
+
+      if (((millis() - ButtonChangedAt) < 300) && ((millis() - ButtonChangedAt) > 50))
+      {
+        // Short press.  Changes screen or (if editing) current value
+        ShortPress();
+      }
+    }
+    
+    ButtonState = NewButtonState;
+    ButtonChangedAt = millis();
+  }
 }
 
 void UpdateDisplay(void)
+{
+  switch(ScreenNumber)
+  {
+    case 1:  UpdateTelemetryScreen();    break;
+  }
+}
+  
+void UpdateTelemetryScreen(void)
 {
   if (millis() >= UpdateRSSIAt)
   {
     int Bars, Bar;
     
     lcd.setCursor(0, 1);
-    Bars = (readRegister(REG_RSSI_CURRENT) - 47) / 10;
+    Bars = (readRegister(REG_RSSI_CURRENT) - 37) / 8;
     for (Bar=1; Bar<=6; Bar++)
     {
       if (Bar <= Bars)
@@ -208,6 +276,7 @@ void UpdateDisplay(void)
     }
   }
 }
+
 
 void CheckGPS()
 {
@@ -266,6 +335,11 @@ void ProcessGPSLine()
     else if ((GPSBuffer[1] == 'G') && (GPSBuffer[2] == 'P') && (GPSBuffer[3] == 'G') && (GPSBuffer[4] == 'G') && (GPSBuffer[5] == 'A'))
     {
       ProcessGPGGACommand();
+      switch (ScreenNumber)
+      {
+        case 0:  DisplayGPSScreen();       break;
+        case 2:  DisplayDirectionScreen(); break;
+      }
     }
   }
 }
@@ -431,6 +505,11 @@ void ProcessGPRMCCommand()
       }
     }
   }
+  
+  GPS_Latitude = GPS_Latitude_Minutes + GPS_Latitude_Seconds * 5 / 3;
+  if (*GPS_LatitudeSign == '-') GPS_Latitude = -GPS_Latitude;
+  GPS_Longitude = GPS_Longitude_Minutes + GPS_Longitude_Seconds * 5 / 3;
+  if (*GPS_LongitudeSign == '-') GPS_Longitude = -GPS_Longitude;
 }
 
 void ProcessGPGGACommand()
@@ -545,9 +624,8 @@ void CheckRx()
 {
   if (digitalRead(dio0))
   {
-    char Message[256], PayloadID[16], Time[16], LatitudeString[16], LongitudeString[16], RSSIString[6], AltitudeString[8];
+    char Message[256], PayloadID[16], Time[16];
     int Bytes, SentenceCount;
-    long Altitude;
     
     Bytes = receiveMessage(Message);
     
@@ -557,20 +635,18 @@ void CheckRx()
 
     // Telemetry='$$LORA1,108,20:30:39,51.95027,-2.54445,00141,0,0,11*9B74
 			
-    if (sscanf(Message, "%[^,],%d,%[^,],%[^,],%[^,],%ld", PayloadID, &SentenceCount, Time, LatitudeString, LongitudeString, &Altitude) > 0)
+    if (sscanf(Message, "%[^,],%d,%[^,],%[^,],%[^,],%ld", PayloadID, &SentenceCount, Time, LatitudeString, LongitudeString, &HAB_Altitude) > 0)
     {
       LastPacketAt = millis();
 
-      sprintf(AltitudeString, "%05ld", Altitude);
-      
-      lcd.clear();
-      lcd.print(AltitudeString);
-      lcd.setCursor(8, 0);
-      lcd.print(LatitudeString);
-      lcd.setCursor(0, 1);
-      lcd.print(RSSIString);
-      lcd.setCursor(8, 1);
-      lcd.print(LongitudeString);
+      HAB_Latitude = atof(LatitudeString);
+      HAB_Longitude = atof(LongitudeString);
+
+      switch (ScreenNumber)
+      {
+        case 1:  DisplayTelemetryScreen();     break;
+        case 2:  DisplayDirectionScreen();     break;
+      }
       
       UpdateTimeAt = millis() + 10000;
       UpdateRSSIAt = millis() + 4000;
@@ -634,14 +710,15 @@ void setMode(byte newMode)
     default: return;
   } 
   
-  if(newMode != RF96_MODE_SLEEP){
+  if(newMode != RF96_MODE_SLEEP)
+  {
+    Serial.println("Waiting for mode switch");
     while(digitalRead(dio5) == 0)
     {
-      Serial.print("z");
     } 
+    Serial.println("Mode switch done");
   }
    
-  Serial.println(" Mode Change Done");
   return;
 }
 
@@ -690,21 +767,43 @@ void unselect()
 
 void setLoRaMode()
 {
+  unsigned long FrequencyValue;
+  double Frequency;
+
   Serial.println("Setting LoRa Mode");
   setMode(RF96_MODE_SLEEP);
   writeRegister(REG_OPMODE,0x80);
    
-  // frequency  
   setMode(RF96_MODE_SLEEP);
-  /*
-  writeRegister(0x06, 0x6C);
-  writeRegister(0x07, 0x9C);
-  writeRegister(0x08, 0xCC);
-  */
+
+  Serial.print("Setting channel ");
+  Serial.println(Channel);
+  
+  Frequency = 434000000.0 + (double)Channel * 25000.0;
+
+  Serial.print("Frequency is ");
+  Serial.println(Frequency);
+  
+  FrequencyValue = (unsigned long)Frequency;
+  Serial.println(FrequencyValue);
+  
+  FrequencyValue *= 7110656;
+  Serial.println(FrequencyValue);
+  
+  FrequencyValue /= 434;
+
+  Serial.print("FrequencyValue is ");
+  Serial.println(FrequencyValue);
+  
   writeRegister(0x06, 0x6C);
   writeRegister(0x07, 0x9C);
   writeRegister(0x08, 0x8E);
-   
+  /*
+  writeRegister(0x06, (FrequencyValue >> 16) & 0xFF);
+  writeRegister(0x07, (FrequencyValue >> 8) & 0xFF);
+  writeRegister(0x08, FrequencyValue & 0xFF);
+  */
+  
   Serial.println("LoRa Mode Set");
   
   Serial.print("Mode = "); Serial.println(readRegister(REG_OPMODE));
@@ -717,15 +816,27 @@ void setLoRaMode()
 //////////////////////////////////////
 void startReceiving()
 {
-  writeRegister(REG_MODEM_CONFIG, EXPLICIT_MODE | ERROR_CODING_4_8 | BANDWIDTH_20K8);
-  writeRegister(REG_MODEM_CONFIG2, SPREADING_11 | CRC_ON);
-  writeRegister(0x26, 0x0C);    // 0000 1 1 00
-  Serial.println("Set slow mode");
-	
-  writeRegister(0x26, 0x0C);    // 0000 1 1 00
-  writeRegister(REG_PAYLOAD_LENGTH, 80);
-  writeRegister(REG_RX_NB_BYTES, 80);
-
+  if (LoraMode)
+  {
+    writeRegister(REG_MODEM_CONFIG, IMPLICIT_MODE | ERROR_CODING_4_5 | BANDWIDTH_20K8);
+    writeRegister(REG_MODEM_CONFIG2, SPREADING_6);
+    writeRegister(0x31, (readRegister(0x31) & 0xF8) | 0x05);
+    writeRegister(0x37, 0x0C);
+    // writeRegister(0x26, 0x0C);    // 0000 1 1 00
+    writeRegister(REG_PAYLOAD_LENGTH, 255);
+    writeRegister(REG_RX_NB_BYTES, 255);
+    Serial.println("Set fast mode");
+  }
+  else
+  {
+    writeRegister(REG_MODEM_CONFIG, EXPLICIT_MODE | ERROR_CODING_4_8 | BANDWIDTH_20K8);
+    writeRegister(REG_MODEM_CONFIG2, SPREADING_11 | CRC_ON);
+    writeRegister(0x26, 0x0C);    // 0000 1 1 00
+    writeRegister(REG_PAYLOAD_LENGTH, 80);
+    writeRegister(REG_RX_NB_BYTES, 80);
+    Serial.println("Set slow mode");
+  }
+  
   writeRegister(REG_HOP_PERIOD,0xFF);
   writeRegister(REG_FIFO_ADDR_PTR, readRegister(REG_FIFO_RX_BASE_AD));   
   
@@ -735,19 +846,297 @@ void startReceiving()
 
 void setupRFM98(void)
 {
-  // initialize the pins
-  pinMode( _slaveSelectPin, OUTPUT);
-  pinMode(dio0, INPUT);
-  pinMode(dio5, INPUT);
-
   SPI.begin();
   
   // LoRa mode 
   setLoRaMode();
+    
+  Serial.println("Setup Complete");
   
   startReceiving();
-  
-  Serial.println("Setup Complete");
 }
 
+void ShortPress(void)
+{
+  if (Editing)
+  {
+    switch(ScreenNumber)
+    {
+      case 3:  ShortPressFrequencyScreen();   break;
+      case 4:  ShortPressModeScreen();        break;
+    }
+  }
+  else
+  {
+    if (++ScreenNumber > 4)
+    {
+      ScreenNumber = 0;
+    }
+      
+    DisplayScreen();
+  }
+}
+
+void LongPress(void)
+{
+  if (ScreenNumber > 2)
+  {
+    Editing = !Editing;
+  
+    if (Editing)
+    {
+      DisplayEditScreen();
+    }
+    else
+    {
+      EEPROM.write(3, LoraMode);
+      EEPROM.write(2, Channel);
+      EEPROM.write(1, 'A');
+      EEPROM.write(0, 'D');
+      
+      DisplayScreen();
+    }
+  }
+}
+  
+void ShortPressFrequencyScreen(void)
+{
+  if (++Channel > 26)
+  {
+    Channel = 0;
+  }
+  
+  setLoRaMode();
+  startReceiving();
+  
+  DisplayChannel();
+}
+
+void ShortPressModeScreen(void)
+{
+  if (++LoraMode > 1)
+  {
+    LoraMode = 0;
+  }
+
+  setLoRaMode();
+  startReceiving();
+  
+  DisplayLoraMode();
+}
+
+
+void DisplayScreen(void)
+{ 
+  switch(ScreenNumber)
+  {
+    case 0:  DisplayGPSScreen();         break;
+    case 1:  DisplayTelemetryScreen();   break;
+    case 2:  DisplayDirectionScreen();   break;
+    case 3:  DisplayFrequencyScreen();   break;
+    case 4:  DisplayModeScreen();        break;
+  }
+}
+
+void DisplayEditScreen(void)
+{
+  lcd.clear();
+  
+  switch(ScreenNumber)
+  {
+    case 3:  DisplayFrequencyEditScreen();   break;
+    case 4:  DisplayModeEditScreen();        break;
+  }
+}
+
+void DisplayGPSScreen(void)
+{
+  char Temp[10];
+
+  lcd.clear();
+  
+  lcd.print(GPS_Time+3);
+
+  dtostrf(GPS_Latitude, 7, 5, Temp);
+  lcd.setCursor(8, 0);
+  lcd.print(Temp);
+
+  lcd.setCursor(0, 1);
+  lcd.print(GPS_Altitude);
+  lcd.print("m");
+
+  dtostrf(GPS_Longitude, 7, 5, Temp);
+  lcd.setCursor(8, 1);
+  lcd.print(Temp);
+}
+  
+void DisplayTelemetryScreen(void)
+{
+  lcd.clear();
+  
+  if (LastPacketAt)
+  {
+    char AltitudeString[8];
+    
+    sprintf(AltitudeString, "%05ld", HAB_Altitude);
+      
+    lcd.print(AltitudeString);
+    lcd.setCursor(8, 0);
+    lcd.print(LatitudeString);
+    lcd.setCursor(0, 1);
+    lcd.print(RSSIString);
+    lcd.setCursor(8, 1);
+    lcd.print(LongitudeString);
+  }
+  else 
+  {  
+    lcd.print("Waiting for data");
+  }
+}
+
+  
+void DisplayDirectionScreen(void)
+{
+  double DistanceToHAB, DirectionToHAB;
+  int Clock;
+  long Distance;
+  
+  lcd.clear();
+  if ((GPS_Satellites >= 3) && (LastPacketAt > 0))
+  {
+    // Have both positions so we can calculate distance and direction
+    DistanceToHAB = CalculateDistance(HAB_Latitude, HAB_Longitude, GPS_Latitude, GPS_Longitude);
+    Serial.println("");
+    Serial.println(HAB_Latitude);
+    Serial.println(HAB_Longitude);
+    Serial.println(GPS_Latitude);
+    Serial.println(GPS_Longitude);
+    Serial.println(DistanceToHAB);
+    Serial.println("");
+
+    DirectionToHAB = CalculateDirection(HAB_Latitude, HAB_Longitude, GPS_Latitude, GPS_Longitude) - GPS_Direction;
+    
+    DistanceToHAB = floor(DistanceToHAB);
+    Distance = DistanceToHAB;
+    
+    DirectionToHAB = floor(DirectionToHAB / 30 + 12.5);
+    Clock = DirectionToHAB;
+    Clock %= 12;
+
+    
+    lcd.print("Dir:  ");
+    lcd.print(Clock);
+    lcd.print(" o'clock");
+    
+    lcd.setCursor(0,1);
+    lcd.print("Dist: ");
+    lcd.print(Distance);
+    lcd.print("m");
+    
+  }
+  else
+  {
+    lcd.print("No direction ...");
+    if (GPS_Satellites <= 3)
+    {
+      lcd.setCursor(0,1);
+      lcd.print ("No GPS");
+      Serial.println("No Gps\n");
+    }
+    if (LastPacketAt == 0)
+    {
+      lcd.setCursor(7,1);
+      lcd.print ("No Packet");
+    }
+  }
+}
+
+void DisplayFrequencyScreen(void)
+{
+  lcd.clear();
+  lcd.print("Hold to edit Frq");
+  
+  DisplayChannel();
+}
+
+void DisplayModeScreen(void)
+{
+  lcd.clear();
+  lcd.print("Hold to chg Mode");
+  
+  DisplayLoraMode();
+}
+
+void DisplayFrequencyEditScreen(void)
+{
+  lcd.print("Press ^   Hold X");
+  
+  DisplayChannel();
+}
+
+void DisplayChannel(void)
+{
+  char Value[4];
+
+  lcd.setCursor(0, 1);
+  lcd.print("434.");
+  sprintf(Value, "%03d", Channel * 25);
+  lcd.print(Value);
+  lcd.print("MHz");
+}
+
+void DisplayLoraMode(void)
+{
+  lcd.setCursor(0, 1);
+  lcd.print(LoraMode ? "Fast Mode" : "Slow Mode");
+}
+
+void DisplayModeEditScreen(void)
+{
+  lcd.print("Press ^   Hold X");
+  
+  DisplayLoraMode();
+}
+
+double CalculateDistance(double flat1, double flon1, double flat2, double flon2)
+{
+  double dist_calc=0;
+  double dist_calc2=0;
+  double diflat=0;
+  double diflon=0;
+
+  //I've to spplit all the calculation in several steps. If i try to do it in a single line the arduino will explode.
+  diflat=radians(flat2-flat1);
+  flat1=radians(flat1);
+  flat2=radians(flat2);
+  diflon=radians((flon2)-(flon1));
+
+  dist_calc = (sin(diflat/2.0)*sin(diflat/2.0));
+  dist_calc2= cos(flat1);
+  dist_calc2*=cos(flat2);
+  dist_calc2*=sin(diflon/2.0);
+  dist_calc2*=sin(diflon/2.0);
+  dist_calc +=dist_calc2;
+
+  dist_calc=(2*atan2(sqrt(dist_calc),sqrt(1.0-dist_calc)));
+
+  dist_calc*=6371000.0; //Converting to meters
+  //Serial.println(dist_calc);
+  return dist_calc;  
+}
+
+double CalculateDirection(double HABLatitude, double HABLongitude, double CarLatitude, double CarLongitude)
+{
+    double x, y;
+
+    HABLatitude = HABLatitude * Pi / 180;
+    HABLongitude = HABLongitude * Pi / 180;
+    CarLatitude = CarLatitude * Pi / 180;
+    CarLongitude = CarLongitude * Pi / 180;
+
+    y = sin(HABLongitude - CarLongitude) * cos(HABLatitude);
+    x = cos(CarLatitude) * sin(HABLatitude) - sin(CarLatitude) * cos(HABLatitude) * cos(HABLongitude - CarLongitude);
+
+    return atan2(y, x) * 180 / Pi;
+}
 
