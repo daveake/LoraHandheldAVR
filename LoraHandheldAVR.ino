@@ -36,7 +36,7 @@ byte currentMode = 0x81;
 unsigned long LastPacketAt=0;
 unsigned long UpdateTimeAt=0;
 unsigned long UpdateRSSIAt=0;
-
+double FrequencyOffset=0;
 
 #define REG_FIFO                    0x00
 #define REG_FIFO_ADDR_PTR           0x0D 
@@ -52,9 +52,13 @@ unsigned long UpdateRSSIAt=0;
 #define REG_DIO_MAPPING_2           0x41
 #define REG_MODEM_CONFIG            0x1D
 #define REG_MODEM_CONFIG2           0x1E
+#define REG_MODEM_CONFIG3           0x26
 #define REG_PAYLOAD_LENGTH          0x22
 #define REG_IRQ_FLAGS_MASK          0x11
 #define REG_HOP_PERIOD              0x24
+#define REG_FREQ_ERROR		    0x28
+#define REG_DETECT_OPT		    0x31
+#define	REG_DETECTION_THRESHOLD	    0x37
 
 // MODES
 // MODES
@@ -580,7 +584,25 @@ void ProcessGPGGACommand()
   }
 }
 
-int receiveMessage(char *message)
+double FrequencyError(void)
+{
+  int32_t Temp;
+	
+  Temp = (int32_t)readRegister(REG_FREQ_ERROR) & 7;
+  Temp <<= 8L;
+  Temp += (int32_t)readRegister(REG_FREQ_ERROR+1);
+  Temp <<= 8L;
+  Temp += (int32_t)readRegister(REG_FREQ_ERROR+2);
+	
+  if (readRegister(REG_FREQ_ERROR) & 8)
+  {
+    Temp = Temp - 524288;
+  }
+
+  return - ((double)Temp * 16777216.0 / 32000000.0) * (20800 / 500000.0);
+}	
+
+int receiveMessage(char *message, int Length)
 {
   int i, Bytes, currentAddr;
 
@@ -600,11 +622,23 @@ int receiveMessage(char *message)
   }
   else
   {
+    double FreqError;
+    
     currentAddr = readRegister(REG_FIFO_RX_CURRENT_ADDR);
     Bytes = readRegister(REG_RX_NB_BYTES);
-    // printf ("%d bytes in packet\n", Bytes);
-
-    // printf("RSSI = %d\n", readRegister(REG_RSSI) - 137);
+    FreqError = FrequencyError();
+    
+    Serial.print("Freq Error "); Serial.println(FreqError);
+    
+    if (fabs(FreqError) > 500)
+    {
+      FrequencyOffset += FreqError;
+      setFrequency();
+      setMode(RF96_MODE_RX_CONTINUOUS); 
+      // setLoRaMode();
+    }
+    
+    if (Bytes > Length) Bytes = Length;
 	
     writeRegister(REG_FIFO_ADDR_PTR, currentAddr);   
     // now loop over the fifo getting the data
@@ -620,36 +654,79 @@ int receiveMessage(char *message)
   return Bytes;
 }
 
+uint16_t CRC16(unsigned char *Message, int Length)
+{
+  uint16_t CRC, xPolynomial;
+  int i, j;
+	
+  CRC = 0xffff;           // Seed
+  xPolynomial = 0x1021;
+   
+  for (i=2; i<(Length-6); i++)
+  {
+    CRC ^= (((unsigned int)Message[i]) << 8);
+    for (j=0; j<8; j++)
+    {
+      if (CRC & 0x8000)
+        CRC = (CRC << 1) ^ 0x1021;
+      else
+        CRC <<= 1;
+    }
+  }
+	 
+  return CRC;
+}
+
+int CRCOK(char *Message)
+{
+  int Length;
+  char CRC[5];
+  
+  Length = strlen(Message);
+  sprintf(CRC, "%04X", CRC16((unsigned char *)Message, Length));
+  
+  return (strncmp(Message+Length-5, CRC, 4) == 0);
+}
+  
 void CheckRx()
 {
   if (digitalRead(dio0))
   {
-    char Message[256], PayloadID[16], Time[16];
+    char Message[128], PayloadID[16], Time[16];
     int Bytes, SentenceCount;
     
-    Bytes = receiveMessage(Message);
+    Bytes = receiveMessage(Message, sizeof(Message));
     
+    // Serial.print("Packet size = "); Serial.println(Bytes);
+
     sprintf(RSSIString, "%ddB", readRegister(REG_RSSI_PACKET) - 137);
     
-    Serial.print("Packet size = "); Serial.println(Bytes);
-
     // Telemetry='$$LORA1,108,20:30:39,51.95027,-2.54445,00141,0,0,11*9B74
-			
-    if (sscanf(Message, "%[^,],%d,%[^,],%[^,],%[^,],%ld", PayloadID, &SentenceCount, Time, LatitudeString, LongitudeString, &HAB_Altitude) > 0)
-    {
-      LastPacketAt = millis();
-
-      HAB_Latitude = atof(LatitudeString);
-      HAB_Longitude = atof(LongitudeString);
-
-      switch (ScreenNumber)
+    
+    if ((Message[0] == '$') && (Message[1] == '$'))
+    {      
+      if (CRCOK(Message))
       {
-        case 1:  DisplayTelemetryScreen();     break;
-        case 2:  DisplayDirectionScreen();     break;
-      }
+        if (sscanf(Message, "%[^,],%d,%[^,],%[^,],%[^,],%ld", PayloadID, &SentenceCount, Time, LatitudeString, LongitudeString, &HAB_Altitude) > 0)
+        {
+          LastPacketAt = millis();
+
+          HAB_Latitude = atof(LatitudeString);
+          HAB_Longitude = atof(LongitudeString);
+
+          switch (ScreenNumber)
+          {
+            case 1:  DisplayTelemetryScreen();     break;
+            case 2:  DisplayDirectionScreen();     break;
+          }
       
-      UpdateTimeAt = millis() + 10000;
-      UpdateRSSIAt = millis() + 4000;
+          UpdateTimeAt = millis() + 10000;
+          UpdateRSSIAt = millis() + 4000;
+
+          // Serial.print("Message "); Serial.println(Message);
+          Serial.print("Altitude "); Serial.println(HAB_Altitude);
+        }
+      }
     }
   }
 }
@@ -765,6 +842,34 @@ void unselect()
 }
 
 
+void setFrequency()
+{
+  unsigned long FrequencyValue;
+  double Frequency;
+  
+  Frequency = 434000000.0 + (double)Channel * 25000.0 + FrequencyOffset;
+
+  Serial.print("Frequency is ");
+  Serial.println(Frequency);
+
+  Frequency = Frequency * 7110656 / 434000000;
+  FrequencyValue = (unsigned long)(Frequency);
+
+  Serial.print("FrequencyValue is ");
+  Serial.println(FrequencyValue);
+
+  writeRegister(0x06, (FrequencyValue >> 16) & 0xFF);		// Set frequency
+  writeRegister(0x07, (FrequencyValue >> 8) & 0xFF);
+  writeRegister(0x08, FrequencyValue & 0xFF);
+
+  /*
+  writeRegister(0x06, 0x6C);
+  writeRegister(0x07, 0x9C);
+  writeRegister(0x08, 0x8E);
+  */
+}
+
+
 void setLoRaMode()
 {
   unsigned long FrequencyValue;
@@ -779,32 +884,9 @@ void setLoRaMode()
   Serial.print("Setting channel ");
   Serial.println(Channel);
   
-  Frequency = 434000000.0 + (double)Channel * 25000.0;
+  // Frequency = 434000000.0 + (double)Channel * 25000.0 + FrequencyOffset;
 
-  Serial.print("Frequency is ");
-  Serial.println(Frequency);
-  
-  FrequencyValue = (unsigned long)Frequency;
-  Serial.println(FrequencyValue);
-  
-  FrequencyValue *= 7110656;
-  Serial.println(FrequencyValue);
-  
-  FrequencyValue /= 434;
-
-  Serial.print("FrequencyValue is ");
-  Serial.println(FrequencyValue);
-  
-  writeRegister(0x06, 0x6C);
-  writeRegister(0x07, 0x9C);
-  writeRegister(0x08, 0x8E);
-  /*
-  writeRegister(0x06, (FrequencyValue >> 16) & 0xFF);
-  writeRegister(0x07, (FrequencyValue >> 8) & 0xFF);
-  writeRegister(0x08, FrequencyValue & 0xFF);
-  */
-  
-  Serial.println("LoRa Mode Set");
+  setFrequency();
   
   Serial.print("Mode = "); Serial.println(readRegister(REG_OPMODE));
   
@@ -820,25 +902,30 @@ void startReceiving()
   {
     writeRegister(REG_MODEM_CONFIG, IMPLICIT_MODE | ERROR_CODING_4_5 | BANDWIDTH_20K8);
     writeRegister(REG_MODEM_CONFIG2, SPREADING_6);
-    writeRegister(0x31, (readRegister(0x31) & 0xF8) | 0x05);
-    writeRegister(0x37, 0x0C);
-    // writeRegister(0x26, 0x0C);    // 0000 1 1 00
-    writeRegister(REG_PAYLOAD_LENGTH, 255);
-    writeRegister(REG_RX_NB_BYTES, 255);
+    writeRegister(REG_MODEM_CONFIG3, 0x04);
+    
+    writeRegister(REG_DETECT_OPT, (readRegister(REG_DETECT_OPT) & 0xF8) | 0x05);
+    writeRegister(REG_DETECTION_THRESHOLD, 0x0C);
+
     Serial.println("Set fast mode");
   }
   else
   {
     writeRegister(REG_MODEM_CONFIG, EXPLICIT_MODE | ERROR_CODING_4_8 | BANDWIDTH_20K8);
     writeRegister(REG_MODEM_CONFIG2, SPREADING_11 | CRC_ON);
-    writeRegister(0x26, 0x0C);    // 0000 1 1 00
-    writeRegister(REG_PAYLOAD_LENGTH, 80);
-    writeRegister(REG_RX_NB_BYTES, 80);
+    writeRegister(REG_MODEM_CONFIG3, 0x0C);
+    
+    writeRegister(REG_DETECT_OPT, (readRegister(REG_DETECT_OPT) & 0xF8) | 0x03);
+    writeRegister(REG_DETECTION_THRESHOLD, 0x0A);
+
     Serial.println("Set slow mode");
   }
+
+  writeRegister(REG_PAYLOAD_LENGTH, 255);
+  writeRegister(REG_RX_NB_BYTES, 255);
   
-  writeRegister(REG_HOP_PERIOD,0xFF);
-  writeRegister(REG_FIFO_ADDR_PTR, readRegister(REG_FIFO_RX_BASE_AD));   
+  writeRegister(REG_FIFO_RX_BASE_AD, 0);
+  writeRegister(REG_FIFO_ADDR_PTR, 0);
   
   // Setup Receive Continous Mode
   setMode(RF96_MODE_RX_CONTINUOUS); 
