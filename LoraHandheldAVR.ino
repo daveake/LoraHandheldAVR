@@ -1,4 +1,4 @@
-// LoRa reciver with LCD 2-line display
+// LoRa receiver with LCD 2-line display
 
 #include <string.h>
 #include <ctype.h>
@@ -9,6 +9,7 @@
 /*---------------------------------------------------*\
 |                                                     |
 |               Arduino A0 - Switch (other side GND)  |
+|               Arduino Rx - GPS Tx NMEA 9600 baud    |
 |               Arduino  2 - RFM DIO5                 |
 |               Arduino  3 - RFM DIO0                 |
 |               Arduino  4 - LCD D4                   |
@@ -125,8 +126,8 @@ unsigned long SendGPSConfig;
 char GPS_Time[9] = "00:00:00";
 unsigned int GPS_Latitude_Minutes, GPS_Longitude_Minutes;
 double GPS_Latitude_Seconds, GPS_Longitude_Seconds;
-char *GPS_LatitudeSign="";
-char *GPS_LongitudeSign="";
+char *GPS_LatitudeSign=(char *)"";
+char *GPS_LongitudeSign=(char *)"";
 double GPS_Longitude, GPS_Latitude;
 unsigned int GPS_Altitude=0, MaximumAltitude=0, MaxAltitudeThisSentence=0;
 byte GotGPSThisSentence=0;
@@ -136,13 +137,14 @@ unsigned int GPS_Speed=0;
 unsigned int GPS_Direction=0;
 long HAB_Altitude;
 double HAB_Latitude, HAB_Longitude;
-char LatitudeString[16], LongitudeString[16], RSSIString[6];
+char LatitudeString[16], LongitudeString[16], RSSIString[8];
 unsigned long ButtonChangedAt=0;
 int ButtonState=1;
 int Editing=0;
 int ScreenNumber=0;
 uint8_t Channel=18;
 uint8_t LoraMode=0;
+int8_t ChannelOffset=0;
 
 char Hex[] = "0123456789ABCDEF";
 
@@ -169,10 +171,11 @@ void setup()
 
   DisplayScreen();
  
-  if ((EEPROM.read(0) == 'D') && (EEPROM.read(1) == 'A'))
+  if ((EEPROM.read(0) == 'D') && (EEPROM.read(1) == 'B'))
   {
     Channel = EEPROM.read(2);
     LoraMode = EEPROM.read(3);
+    ChannelOffset = EEPROM.read(4);
   }
   
   setupRFM98();
@@ -221,6 +224,16 @@ void loop()
     ButtonState = NewButtonState;
     ButtonChangedAt = millis();
   }
+}
+
+double Bandwidth(void)
+{
+   if (LoraMode == 2)
+   {
+      return 62500;
+   }
+
+   return 20800; 
 }
 
 void UpdateDisplay(void)
@@ -393,7 +406,7 @@ void ProcessGPRMCCommand()
             GPS_Longitude_Seconds = 0;
             GPS_Speed = 0;
             GPS_Direction = 0;
-            GPS_LongitudeSign = "-";  // new
+            GPS_LongitudeSign = (char *)"-";  // new
           }
           else
           {
@@ -430,11 +443,11 @@ void ProcessGPRMCCommand()
             // Latitude = GPS_Latitude_Minutes + GPS_Latitude_Seconds * 5 / 30000;
             if (GPSBuffer[i] == 'S')
             {
-              GPS_LatitudeSign = "-";
+              GPS_LatitudeSign = (char *)"-";
             }
             else
             {
-              GPS_LatitudeSign = "";
+              GPS_LatitudeSign = (char *)"";
             }
           }
           break;  // Start bit
@@ -467,7 +480,7 @@ void ProcessGPRMCCommand()
           {
             if (GPSBuffer[i] == 'E')
             {
-              GPS_LongitudeSign = "";
+              GPS_LongitudeSign = (char *)"";
             }
           }
           break;  // Start bit
@@ -599,7 +612,7 @@ double FrequencyError(void)
     Temp = Temp - 524288;
   }
 
-  return - ((double)Temp * 16777216.0 / 32000000.0) * (20800 / 500000.0);
+  return - ((double)Temp * 16777216.0 / 32000000.0) * (Bandwidth() / 500000.0);
 }	
 
 int receiveMessage(char *message, int Length)
@@ -610,7 +623,6 @@ int receiveMessage(char *message, int Length)
   // printf("Message status = %02Xh\n", x);
   
   // clear the rxDone flag
-  // writeRegister(REG_IRQ_FLAGS, 0x40); 
   writeRegister(REG_IRQ_FLAGS, 0xFF); 
    
   // check for payload crc issues (0x20 is the bit we are looking for
@@ -627,12 +639,31 @@ int receiveMessage(char *message, int Length)
     currentAddr = readRegister(REG_FIFO_RX_CURRENT_ADDR);
     Bytes = readRegister(REG_RX_NB_BYTES);
     FreqError = FrequencyError();
-    
-    Serial.print("Freq Error "); Serial.println(FreqError);
-    
-    if (fabs(FreqError) > 500)
+
+    if (ScreenNumber == 5)
     {
+      DisplayFrequencyError((int)(FreqError/1000));
+    }
+    
+    if ((fabs(FreqError) > 500) && (ScreenNumber != 5) || Editing)
+    {
+      Serial.print("Need to tune ");     
+      if (FreqError > 0)
+      {
+        Serial.print("up by "); Serial.print(FreqError / 1000);
+      }
+      else
+      {
+        Serial.print("down by "); Serial.print(-FreqError / 1000);
+      }
+      Serial.println("kHz");
+      
       FrequencyOffset += FreqError;
+      Serial.print("FrequencyOffset is now ");
+      Serial.print(FrequencyOffset / 1000);
+      Serial.println("kHz");
+      
+      setMode(RF96_MODE_SLEEP);
       setFrequency();
       setMode(RF96_MODE_RX_CONTINUOUS); 
       // setLoRaMode();
@@ -687,19 +718,53 @@ int CRCOK(char *Message)
   
   return (strncmp(Message+Length-5, CRC, 4) == 0);
 }
+
+int FixRSSI(int RawRSSI, int SNR)
+{
+  int RSSI;
   
+  // LF port (Bands 2/3)
+  RSSI = RawRSSI - 164;
+  
+  if (SNR < 0)
+  {
+    RSSI += SNR/4;
+  }
+  
+  return RSSI;
+}
+
+int PacketSNR(void)
+{
+  int8_t SNR;
+
+  SNR = readRegister(REG_RSSI_PACKET);
+  SNR /= 4;
+  
+  return (int)SNR;
+}
+
+int PacketRSSI(void)
+{
+  int SNR;
+  
+  SNR = PacketSNR();
+  
+  return FixRSSI(readRegister(REG_RSSI_PACKET), SNR);
+}
+
 void CheckRx()
 {
   if (digitalRead(dio0))
   {
-    char Message[128], PayloadID[16], Time[16];
+    char Message[256], PayloadID[16], Time[16];
     int Bytes, SentenceCount;
     
     Bytes = receiveMessage(Message, sizeof(Message));
     
     // Serial.print("Packet size = "); Serial.println(Bytes);
 
-    sprintf(RSSIString, "%ddB", readRegister(REG_RSSI_PACKET) - 137);
+    sprintf(RSSIString, "%ddB", PacketRSSI());  // readRegister(REG_RSSI_PACKET) - 137);
     
     // Telemetry='$$LORA1,108,20:30:39,51.95027,-2.54445,00141,0,0,11*9B74
     
@@ -707,7 +772,7 @@ void CheckRx()
     {      
       if (CRCOK(Message))
       {
-        if (sscanf(Message, "%[^,],%d,%[^,],%[^,],%[^,],%ld", PayloadID, &SentenceCount, Time, LatitudeString, LongitudeString, &HAB_Altitude) > 0)
+        if (sscanf(Message+2, "%[^,],%d,%[^,],%[^,],%[^,],%ld", PayloadID, &SentenceCount, Time, LatitudeString, LongitudeString, &HAB_Altitude) > 0)
         {
           LastPacketAt = millis();
 
@@ -724,7 +789,7 @@ void CheckRx()
           UpdateRSSIAt = millis() + 4000;
 
           // Serial.print("Message "); Serial.println(Message);
-          Serial.print("Altitude "); Serial.println(HAB_Altitude);
+          Serial.print("Rx from "); Serial.println(PayloadID);
         }
       }
     }
@@ -770,17 +835,17 @@ void setMode(byte newMode)
       writeRegister(REG_LNA, LNA_MAX_GAIN);  // LNA_MAX_GAIN);  // MAX GAIN FOR RECIEVE
       writeRegister(REG_OPMODE, newMode);
       currentMode = newMode; 
-      Serial.println("Changing to Receive Continuous Mode\n");
+      // Serial.println("Changing to Receive Continuous Mode\n");
       break;
       
       break;
     case RF96_MODE_SLEEP:
-      Serial.println("Changing to Sleep Mode"); 
+      // Serial.println("Changing to Sleep Mode"); 
       writeRegister(REG_OPMODE, newMode);
       currentMode = newMode; 
       break;
     case RF96_MODE_STANDBY:
-      Serial.println("Changing to Standby Mode");
+      // Serial.println("Changing to Standby Mode");
       writeRegister(REG_OPMODE, newMode);
       currentMode = newMode; 
       break;
@@ -847,26 +912,18 @@ void setFrequency()
   unsigned long FrequencyValue;
   double Frequency;
   
-  Frequency = 434000000.0 + (double)Channel * 25000.0 + FrequencyOffset;
+  Frequency = 434000000.0 + (double)Channel * 25000.0 + ChannelOffset * 1000.0 + FrequencyOffset;
 
   Serial.print("Frequency is ");
-  Serial.println(Frequency);
+  Serial.print(Frequency / 1000, 0);
+  Serial.println(" kHz");
 
   Frequency = Frequency * 7110656 / 434000000;
   FrequencyValue = (unsigned long)(Frequency);
 
-  Serial.print("FrequencyValue is ");
-  Serial.println(FrequencyValue);
-
   writeRegister(0x06, (FrequencyValue >> 16) & 0xFF);		// Set frequency
   writeRegister(0x07, (FrequencyValue >> 8) & 0xFF);
   writeRegister(0x08, FrequencyValue & 0xFF);
-
-  /*
-  writeRegister(0x06, 0x6C);
-  writeRegister(0x07, 0x9C);
-  writeRegister(0x08, 0x8E);
-  */
 }
 
 
@@ -898,7 +955,18 @@ void setLoRaMode()
 //////////////////////////////////////
 void startReceiving()
 {
-  if (LoraMode)
+  if (LoraMode == 2)
+  {
+    writeRegister(REG_MODEM_CONFIG, EXPLICIT_MODE | ERROR_CODING_4_8 | BANDWIDTH_62K5);
+    writeRegister(REG_MODEM_CONFIG2, SPREADING_8);
+    writeRegister(REG_MODEM_CONFIG3, 0x04);
+    
+    writeRegister(REG_DETECT_OPT, (readRegister(REG_DETECT_OPT) & 0xF8) | 0x05);
+    writeRegister(REG_DETECTION_THRESHOLD, 0x0C);
+
+    Serial.println("Set TDM mode");
+  }
+  else if (LoraMode == 1)
   {
     writeRegister(REG_MODEM_CONFIG, IMPLICIT_MODE | ERROR_CODING_4_5 | BANDWIDTH_20K8);
     writeRegister(REG_MODEM_CONFIG2, SPREADING_6);
@@ -951,11 +1019,12 @@ void ShortPress(void)
     {
       case 3:  ShortPressFrequencyScreen();   break;
       case 4:  ShortPressModeScreen();        break;
+      case 5:  ShortPressOffsetScreen();      break;
     }
   }
   else
   {
-    if (++ScreenNumber > 4)
+    if (++ScreenNumber > 5)
     {
       ScreenNumber = 0;
     }
@@ -976,9 +1045,10 @@ void LongPress(void)
     }
     else
     {
+      EEPROM.write(4, ChannelOffset);
       EEPROM.write(3, LoraMode);
       EEPROM.write(2, Channel);
-      EEPROM.write(1, 'A');
+      EEPROM.write(1, 'B');
       EEPROM.write(0, 'D');
       
       DisplayScreen();
@@ -1001,7 +1071,7 @@ void ShortPressFrequencyScreen(void)
 
 void ShortPressModeScreen(void)
 {
-  if (++LoraMode > 1)
+  if (++LoraMode > 2)
   {
     LoraMode = 0;
   }
@@ -1010,6 +1080,19 @@ void ShortPressModeScreen(void)
   startReceiving();
   
   DisplayLoraMode();
+}
+
+void ShortPressOffsetScreen(void)
+{
+  if (++ChannelOffset > 5)
+  {
+    ChannelOffset = -5;
+  }
+  
+  setLoRaMode();
+  startReceiving();
+  
+  DisplayChannelOffset();
 }
 
 
@@ -1022,6 +1105,7 @@ void DisplayScreen(void)
     case 2:  DisplayDirectionScreen();   break;
     case 3:  DisplayFrequencyScreen();   break;
     case 4:  DisplayModeScreen();        break;
+    case 5:  DisplayOffsetScreen();      break;
   }
 }
 
@@ -1033,6 +1117,11 @@ void DisplayEditScreen(void)
   {
     case 3:  DisplayFrequencyEditScreen();   break;
     case 4:  DisplayModeEditScreen();        break;
+    case 5:  FrequencyOffset = 0;
+             setMode(RF96_MODE_SLEEP);
+             setFrequency();
+             setMode(RF96_MODE_RX_CONTINUOUS); 
+             DisplayOffsetEditScreen();      break;
   }
 }
 
@@ -1161,6 +1250,15 @@ void DisplayFrequencyEditScreen(void)
   DisplayChannel();
 }
 
+void DisplayOffsetScreen(void)
+{
+  lcd.clear();
+  lcd.print("Hold: chg offset");
+  
+  DisplayChannelOffset();
+}
+
+
 void DisplayChannel(void)
 {
   char Value[4];
@@ -1172,10 +1270,29 @@ void DisplayChannel(void)
   lcd.print("MHz");
 }
 
-void DisplayLoraMode(void)
+void DisplayFrequencyError(int FreqError)
+{
+  char Value[4];
+
+  lcd.setCursor(7, 1);
+  lcd.print("Err ");
+  lcd.print(FreqError);
+  lcd.print("kHz ");
+}
+void DisplayChannelOffset(void)
 {
   lcd.setCursor(0, 1);
-  lcd.print(LoraMode ? "Fast Mode" : "Slow Mode");
+  lcd.print(ChannelOffset);
+  lcd.print("kHz ");
+}
+
+void DisplayLoraMode(void)
+{
+  const char *Modes[3] = {"Slow", "Fast", " TDM"};
+  
+  lcd.setCursor(0, 1);
+  lcd.print(Modes[LoraMode]);
+  lcd.print(" Mode");
 }
 
 void DisplayModeEditScreen(void)
@@ -1183,6 +1300,13 @@ void DisplayModeEditScreen(void)
   lcd.print("Press ^   Hold X");
   
   DisplayLoraMode();
+}
+
+void DisplayOffsetEditScreen(void)
+{
+  lcd.print("Press ^   Hold X");
+  
+  DisplayChannelOffset();
 }
 
 double CalculateDistance(double flat1, double flon1, double flat2, double flon2)
